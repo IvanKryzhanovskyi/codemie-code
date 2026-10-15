@@ -19,6 +19,12 @@ export interface SessionStatus {
    * for any bytes that are still pending or appended afterwards.
    */
   endedAt?: number;
+  /** Project bound to the session: first usable name seen on a hook, original spelling, set once. */
+  project?: string;
+  /** Distinct project names seen once the session became ambiguous. Sticky: nothing is sent. */
+  projectConflict?: string[];
+  /** The on-disk hooks were scanned for a project (legacy recovery) or there was nothing to scan. */
+  projectScanned?: true;
 }
 
 export function createStatus(): SessionStatus {
@@ -48,6 +54,17 @@ function normalizeStatus(raw: unknown): SessionStatus {
   const endedAt = toOffset(source['endedAt']);
   if (endedAt > 0) {
     status.endedAt = endedAt;
+  }
+  const project = source['project'];
+  if (typeof project === 'string' && project.length > 0) {
+    status.project = project;
+  }
+  const conflict = source['projectConflict'];
+  if (Array.isArray(conflict) && conflict.length > 0 && conflict.every((n) => typeof n === 'string')) {
+    status.projectConflict = (conflict as string[]).slice(0, 8);
+  }
+  if (source['projectScanned'] === true) {
+    status.projectScanned = true;
   }
 
   return status;
