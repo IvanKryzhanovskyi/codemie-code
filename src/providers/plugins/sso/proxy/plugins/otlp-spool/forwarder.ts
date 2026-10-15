@@ -10,7 +10,11 @@ import {
   markSessionEnded,
 } from './session-status.js';
 import { OtlpHookSpoolData } from '../otlp.plugin.js';
-import { snapshotPendingBytes, snapshotPendingHookRecords } from './spool-io.js';
+import {
+  isProjectStillSendable,
+  snapshotPendingBytes,
+  snapshotPendingHookRecords,
+} from './spool-io.js';
 import { areCredentialsStale, markCredentialsStale } from './auth-state.js';
 
 const SESSION_END_EVENT_TYPE = 'agent.session.end';
@@ -22,6 +26,9 @@ const OTEL_ENDPOINTS: Record<OtelStream, string> = {
 };
 
 const FORWARD_TIMEOUT_MS = 20_000;
+
+/** Project the session is bound to; the backend gates analytics on it. */
+const PROJECT_HEADER = 'X-CodeMie-Project';
 
 type SendResult = 'ok' | 'failed' | 'auth-expired';
 
@@ -45,13 +52,15 @@ async function postToBackend(
   url: string,
   body: string | Buffer,
   contentType: string,
-  credentials: SSOCredentials | JWTCredentials
+  credentials: SSOCredentials | JWTCredentials,
+  project: string
 ): Promise<Response> {
   const headers = buildAuthHeadersFromCreds(credentials);
   if (!headers) {
     throw new Error('Unsupported credential type');
   }
   headers['Content-Type'] = contentType;
+  headers[PROJECT_HEADER] = project;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FORWARD_TIMEOUT_MS);
@@ -75,16 +84,31 @@ async function send(
   url: string,
   body: string | Buffer,
   contentType: string,
-  credentials: SSOCredentials | JWTCredentials
+  credentials: SSOCredentials | JWTCredentials,
+  project: string
 ): Promise<SendResult> {
   if (areCredentialsStale()) {
     return 'failed';
   }
 
+  // Local re-check before every attempt: narrows the window between the locked snapshot
+  // and the wire, it does not close it. `null` = no longer sendable, nothing is fetched
+  // (the next snapshot discards under the lock).
+  const attempt = async (): Promise<Response | null> =>
+    (await isProjectStillSendable(sessionId, project))
+      ? postToBackend(url, body, contentType, credentials, project)
+      : null;
+
   try {
-    let response = await postToBackend(url, body, contentType, credentials);
+    let response = await attempt();
+    if (!response) {
+      return 'failed';
+    }
     if (isAuthFailure(response)) {
-      response = await postToBackend(url, body, contentType, credentials);
+      response = await attempt();
+      if (!response) {
+        return 'failed';
+      }
       if (isAuthFailure(response)) {
         return 'auth-expired';
       }
@@ -189,7 +213,7 @@ async function forwardHooks(
 
   const url = `${baseUrl}${CODEMIE_ENDPOINTS.CLI_ANALYTICS_EVENT_HOOKS}`;
   const result = await send(
-    sessionId, 'hooks', url, payload.ndjson, 'application/x-ndjson', credentials
+    sessionId, 'hooks', url, payload.ndjson, 'application/x-ndjson', credentials, batch.project
   );
   if (result !== 'ok') {
     return result;
@@ -218,7 +242,7 @@ async function forwardOtelStream(
 
   const url = `${baseUrl}${OTEL_ENDPOINTS[stream]}`;
   const result = await send(
-    sessionId, stream, url, pending.bytes, 'application/x-protobuf', credentials
+    sessionId, stream, url, pending.bytes, 'application/x-protobuf', credentials, pending.project
   );
   if (result !== 'ok') {
     return result;
