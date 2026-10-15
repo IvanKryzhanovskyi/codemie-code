@@ -8,7 +8,22 @@ import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const state = vi.hoisted(() => ({ root: '' }));
+const state = vi.hoisted(() => ({ root: '', failNextAppend: false }));
+
+// Real fs, except appendFile can be told to reject once (the bytes-landing step of appendSpool).
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    appendFile: (...args: Parameters<typeof actual.appendFile>): Promise<void> => {
+      if (state.failNextAppend) {
+        state.failNextAppend = false;
+        return Promise.reject(new Error('ENOSPC: simulated append failure'));
+      }
+      return actual.appendFile(...args);
+    },
+  };
+});
 
 vi.mock('../spool-paths.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../spool-paths.js')>();
@@ -178,6 +193,26 @@ describe('appendSpool — project binding', () => {
     await appendSpool(SESSION, 'hooks', hookLine('A'), ['A']);
 
     expect((await readStatus(SESSION))?.cursors.hooks).toBe(0);
+  });
+
+  it('records the conflict before the bytes land, so a failed append is retried safely', async () => {
+    const { appendSpool } = await import('../spool-io.js');
+    const { readStatus } = await import('../session-status.js');
+    const { readFile } = await import('node:fs/promises');
+    const first = hookLine('A');
+    const conflicting = hookLine('B');
+    await appendSpool(SESSION, 'hooks', first, ['A']); // bound to A, projectScanned true
+
+    state.failNextAppend = true;
+    await expect(appendSpool(SESSION, 'hooks', conflicting, ['B'])).rejects.toThrow(/ENOSPC/);
+
+    expect((await readStatus(SESSION))?.projectConflict).toEqual(['A', 'B']);
+    expect(await readFile(file('hooks.ndjson'), 'utf-8')).toBe(first);
+
+    await appendSpool(SESSION, 'hooks', conflicting, ['B']); // client retries the same batch
+
+    expect((await readStatus(SESSION))?.projectConflict).toEqual(['A', 'B']);
+    expect(await readFile(file('hooks.ndjson'), 'utf-8')).toBe(first + conflicting);
   });
 
   it('keeps the OTEL append path unchanged', async () => {
