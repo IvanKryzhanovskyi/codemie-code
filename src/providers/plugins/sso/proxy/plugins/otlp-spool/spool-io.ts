@@ -1,7 +1,12 @@
-import { appendFile, mkdir, open, stat } from 'node:fs/promises';
-import { spoolRoot, streamFile, type SpoolStream } from './spool-paths.js';
+import { appendFile, mkdir, open, readFile, stat } from 'node:fs/promises';
+import { SPOOL_STREAMS, spoolRoot, streamFile, type SpoolStream } from './spool-paths.js';
 import { withSessionLock } from './session-lock.js';
-import { createStatus, readStatus, writeStatus } from './session-status.js';
+import { createStatus, readStatus, writeStatus, type SessionStatus } from './session-status.js';
+import {
+  applyProjectDecision,
+  decideProject,
+  hookEventProjectNames,
+} from './session-project.js';
 
 const NEWLINE = 0x0a;
 
@@ -40,6 +45,58 @@ async function readRange(
   }
 }
 
+/** Project names of every hook on disk, acknowledged prefix included. Malformed lines are skipped. */
+async function readHookProjectNames(sessionId: string): Promise<string[]> {
+  let text: string;
+  try {
+    text = await readFile(streamFile(sessionId, 'hooks'), 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw err;
+  }
+  const names: string[] = [];
+  for (const line of text.split('\n')) {
+    if (line.trim().length === 0) continue;
+    try {
+      const { hookEvent } = JSON.parse(line) as { hookEvent: string };
+      names.push(...hookEventProjectNames(JSON.parse(hookEvent)));
+    } catch {
+      // unusable record: carries no usable project
+    }
+  }
+  return names;
+}
+
+/**
+ * Legacy recovery: scan the hooks already on disk once and bind or conflict.
+ * Mutates `status` only (caller holds the lock and does the single write).
+ */
+export async function resolveLegacyProjectLocked(
+  sessionId: string,
+  status: SessionStatus
+): Promise<void> {
+  applyProjectDecision(status, decideProject(await readHookProjectNames(sessionId), status));
+  status.projectScanned = true;
+}
+
+/**
+ * Drop the unsent backlog locally: every cursor to EOF. Frees no disk — the sweeper
+ * removes the files once the session is drained and idle. Mutates `status` only.
+ */
+export async function discardBacklogLocked(
+  sessionId: string,
+  status: SessionStatus
+): Promise<void> {
+  for (const stream of SPOOL_STREAMS) {
+    try {
+      const { size } = await stat(streamFile(sessionId, stream));
+      status.cursors[stream] = Math.max(status.cursors[stream], size);
+    } catch {
+      // missing file: nothing to discard
+    }
+  }
+}
+
 /* --------------------------------------------------------------- producers --- */
 
 /**
@@ -51,13 +108,35 @@ async function readRange(
 export async function appendSpool(
   sessionId: string,
   stream: SpoolStream,
-  data: string | Buffer
+  data: string | Buffer,
+  projectNames?: string[]
 ): Promise<void> {
   await withSessionLock(sessionId, async () => {
     await mkdir(spoolRoot(), { recursive: true });
 
     const path = streamFile(sessionId, stream);
-    const recreated = !(await fileExists(path));
+    const exists = await fileExists(path);
+    const recreated = !exists;
+
+    if (stream === 'hooks' && projectNames) {
+      // Observe and decide in the same critical section as the append. The status is
+      // written BEFORE the bytes: a failed append leaves a conservative status and
+      // the hook client retries the same batch.
+      const status = (await readStatus(sessionId)) ?? createStatus();
+      if (!status.projectScanned) {
+        if (exists) {
+          await resolveLegacyProjectLocked(sessionId, status);
+        } else {
+          status.projectScanned = true;
+        }
+      }
+      applyProjectDecision(status, decideProject(projectNames, status));
+      if (recreated) status.cursors.hooks = 0;
+      await writeStatus(sessionId, status);
+      await appendFile(path, data);
+      return;
+    }
+
     await appendFile(path, data);
 
     const status = await readStatus(sessionId);
