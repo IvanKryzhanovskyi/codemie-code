@@ -1,4 +1,6 @@
 import { appendFile, mkdir, open, readFile, stat } from 'node:fs/promises';
+import { logger } from '@/utils/logger.js';
+import { sanitizeLogArgs } from '@/utils/security.js';
 import { SPOOL_STREAMS, spoolRoot, streamFile, type SpoolStream } from './spool-paths.js';
 import { withSessionLock } from './session-lock.js';
 import { createStatus, readStatus, writeStatus, type SessionStatus } from './session-status.js';
@@ -6,6 +8,7 @@ import {
   applyProjectDecision,
   decideProject,
   hookEventProjectNames,
+  projectGate,
 } from './session-project.js';
 
 const NEWLINE = 0x0a;
@@ -86,15 +89,58 @@ export async function resolveLegacyProjectLocked(
 export async function discardBacklogLocked(
   sessionId: string,
   status: SessionStatus
-): Promise<void> {
+): Promise<boolean> {
+  let changed = false;
   for (const stream of SPOOL_STREAMS) {
     try {
       const { size } = await stat(streamFile(sessionId, stream));
-      status.cursors[stream] = Math.max(status.cursors[stream], size);
+      if (size > status.cursors[stream]) {
+        status.cursors[stream] = size;
+        changed = true;
+      }
     } catch {
       // missing file: nothing to discard
     }
   }
+  return changed;
+}
+
+/**
+ * Snapshot-side gate. Caller holds the lock. Returns the bound project, or `null`
+ * after discarding the unsent backlog (conflicted or unbound session). Persists
+ * the status once when anything changed.
+ */
+async function gateProjectLocked(sessionId: string, status: SessionStatus): Promise<string | null> {
+  let dirty = false;
+  if (!status.projectScanned && (await fileExists(streamFile(sessionId, 'hooks')))) {
+    await resolveLegacyProjectLocked(sessionId, status);
+    dirty = true;
+  }
+
+  const gate = projectGate(status);
+  if (gate.state === 'bound') {
+    if (dirty) await writeStatus(sessionId, status);
+    return gate.project;
+  }
+
+  if ((await discardBacklogLocked(sessionId, status)) || dirty) {
+    await writeStatus(sessionId, status);
+    logger.debug(
+      '[otlp-spool] discarded unsent backlog: session project is not sendable',
+      ...sanitizeLogArgs({ sessionId, state: gate.state })
+    );
+  }
+  return null;
+}
+
+/** Locked check that the session is still bound to `project` (case-insensitive) and unconflicted. */
+export async function isProjectStillSendable(sessionId: string, project: string): Promise<boolean> {
+  return withSessionLock(sessionId, async () => {
+    const status = await readStatus(sessionId);
+    if (!status) return false;
+    const gate = projectGate(status);
+    return gate.state === 'bound' && gate.project.toLowerCase() === project.toLowerCase();
+  });
 }
 
 /* --------------------------------------------------------------- producers --- */
@@ -156,6 +202,8 @@ export async function appendSpool(
 /* --------------------------------------------------------------- consumers --- */
 
 export interface PendingBytes {
+  /** Project the session is bound to; sent as `X-CodeMie-Project`. */
+  project: string;
   /** Cursor the snapshot was taken from — pass it back when acknowledging. */
   cursor: number;
   bytes: Buffer;
@@ -175,13 +223,17 @@ export async function snapshotPendingBytes(
   return withSessionLock(sessionId, async () => {
     const status = await readStatus(sessionId);
     if (!status) return null; // session was swept
+    const project = await gateProjectLocked(sessionId, status);
+    if (!project) return null;
     const cursor = status.cursors[stream];
     const bytes = await readRange(sessionId, stream, cursor);
-    return bytes ? { cursor, bytes } : null;
+    return bytes ? { project, cursor, bytes } : null;
   });
 }
 
 export interface PendingHookBatch {
+  /** Project the session is bound to; sent as `X-CodeMie-Project`. */
+  project: string;
   cursor: number;
   /** Complete, newline-terminated NDJSON records. */
   records: string[];
@@ -204,6 +256,8 @@ export async function snapshotPendingHookRecords(
   return withSessionLock(sessionId, async () => {
     const status = await readStatus(sessionId);
     if (!status) return null;
+    const project = await gateProjectLocked(sessionId, status);
+    if (!project) return null;
 
     const cursor = status.cursors.hooks;
     const pending = await readRange(sessionId, 'hooks', cursor);
@@ -218,6 +272,6 @@ export async function snapshotPendingHookRecords(
       .split('\n')
       .filter((line) => line.trim().length > 0);
 
-    return { cursor, records, byteLength: complete.length };
+    return { project, cursor, records, byteLength: complete.length };
   });
 }

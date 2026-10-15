@@ -4,7 +4,9 @@ import type { SSOCredentials, JWTCredentials } from '../../../../../core/types.j
 import { withSessionLock } from './session-lock.js';
 import { readStatus, writeStatus } from './session-status.js';
 import { OTEL_STREAMS } from './spool-paths.js';
-import { hasPendingData, readSpoolState } from './spool-state.js';
+import { hasPendingData, hooksGroupPresent, readSpoolState } from './spool-state.js';
+import { discardBacklogLocked, resolveLegacyProjectLocked } from './spool-io.js';
+import { projectGate } from './session-project.js';
 import { gateDecision } from './completeness-gate.js';
 import { forwardSession } from './forwarder.js';
 import { areCredentialsStale } from './auth-state.js';
@@ -37,6 +39,32 @@ export async function processSessionTick(
     }
 
     const spool = await readSpoolState(sessionId, status);
+
+    // Project gate, before the completeness gate: a conflicted or unbound session
+    // sends nothing whatever OTLP_ALLOW_HOOKS_ONLY_FORWARD says, so a hooks-only
+    // session that would never reach the forwarder snapshots is discarded here.
+    // Pure mutation only (the lock is not reentrant): no updateStatus/advanceCursor.
+    if (status.projectConflict || hooksGroupPresent(spool)) {
+      const recovered = !status.projectScanned;
+      if (recovered) {
+        await resolveLegacyProjectLocked(sessionId, status);
+      }
+      if (projectGate(status).state !== 'bound') {
+        const discarded = await discardBacklogLocked(sessionId, status);
+        if (recovered || discarded) {
+          await writeStatus(sessionId, status);
+          logger.debug(
+            '[otlp-tick] discarded unsent backlog: session project is not sendable',
+            ...sanitizeLogArgs({ sessionId })
+          );
+        }
+        return;
+      }
+      if (recovered) {
+        await writeStatus(sessionId, status);
+      }
+    }
+
     const decision = gateDecision(spool, status);
     const pending = hasPendingData(spool);
 

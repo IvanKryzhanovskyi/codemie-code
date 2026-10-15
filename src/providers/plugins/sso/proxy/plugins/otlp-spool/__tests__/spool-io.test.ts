@@ -191,3 +191,115 @@ describe('appendSpool — project binding', () => {
     expect(status?.projectScanned).toBeUndefined();
   });
 });
+
+describe('snapshots — project gate under the lock', () => {
+  beforeEach(async () => {
+    state.root = await mkdtemp(join(tmpdir(), 'otlp-spool-gate-'));
+  });
+  afterEach(async () => {
+    await rm(state.root, { recursive: true, force: true });
+  });
+
+  async function seedOtel(): Promise<void> {
+    const { appendSpool } = await import('../spool-io.js');
+    await appendSpool(SESSION, 'logs', Buffer.from('L'));
+    await appendSpool(SESSION, 'metrics', Buffer.from('MM'));
+    await appendSpool(SESSION, 'traces', Buffer.from('TTT'));
+  }
+
+  async function expectAllCursorsAtEof(hooksSize: number): Promise<void> {
+    const { readStatus } = await import('../session-status.js');
+    expect((await readStatus(SESSION))?.cursors).toEqual({
+      hooks: hooksSize,
+      logs: 1,
+      metrics: 2,
+      traces: 3,
+    });
+  }
+
+  it('returns bytes plus the project for a bound session', async () => {
+    const { appendSpool, snapshotPendingBytes, snapshotPendingHookRecords } = await import(
+      '../spool-io.js'
+    );
+    await appendSpool(SESSION, 'hooks', hookLine('A'), ['A']);
+    await seedOtel();
+
+    const hooks = await snapshotPendingHookRecords(SESSION);
+    const logs = await snapshotPendingBytes(SESSION, 'logs');
+
+    expect(hooks).toMatchObject({ project: 'A', cursor: 0 });
+    expect(hooks?.records).toHaveLength(1);
+    expect(logs?.project).toBe('A');
+    expect(logs?.bytes.toString()).toBe('L');
+  });
+
+  it('returns null and discards every stream for a conflicted session', async () => {
+    const { appendSpool, snapshotPendingBytes, snapshotPendingHookRecords } = await import(
+      '../spool-io.js'
+    );
+    const hooks = hookLine('A') + hookLine('B');
+    await appendSpool(SESSION, 'hooks', hooks, ['A', 'B']);
+    await seedOtel();
+
+    expect(await snapshotPendingBytes(SESSION, 'logs')).toBeNull();
+    await expectAllCursorsAtEof(Buffer.byteLength(hooks));
+    expect(await snapshotPendingHookRecords(SESSION)).toBeNull();
+  });
+
+  it('returns null and discards every stream for an unbound session', async () => {
+    const { appendSpool, snapshotPendingBytes, snapshotPendingHookRecords } = await import(
+      '../spool-io.js'
+    );
+    const hooks = hookLine('') + hookLine();
+    await appendSpool(SESSION, 'hooks', hooks, ['']);
+    await seedOtel();
+
+    expect(await snapshotPendingHookRecords(SESSION)).toBeNull();
+    await expectAllCursorsAtEof(Buffer.byteLength(hooks));
+    expect(await snapshotPendingBytes(SESSION, 'traces')).toBeNull();
+  });
+
+  it('runs the legacy scan from the snapshot: a single name binds, two conflict', async () => {
+    const { snapshotPendingBytes } = await import('../spool-io.js');
+    const { writeStatus, createStatus, readStatus } = await import('../session-status.js');
+    await writeFile(file('hooks.ndjson'), hookLine('A'));
+    await writeFile(file('otel_logs.bin'), 'L');
+    await writeStatus(SESSION, createStatus());
+
+    const bound = await snapshotPendingBytes(SESSION, 'logs');
+    expect(bound?.project).toBe('A');
+    expect(await readStatus(SESSION)).toMatchObject({ project: 'A', projectScanned: true });
+
+    await rm(file('status'));
+    await writeFile(file('hooks.ndjson'), hookLine('A') + hookLine('B'));
+    await writeStatus(SESSION, createStatus());
+
+    expect(await snapshotPendingBytes(SESSION, 'logs')).toBeNull();
+    const status = await readStatus(SESSION);
+    expect(status?.projectConflict).toEqual(['A', 'B']);
+    expect(status?.cursors.logs).toBe(1);
+  });
+
+  it('nulls all three OTLP snapshots after a late conflict', async () => {
+    const { appendSpool, snapshotPendingBytes } = await import('../spool-io.js');
+    await appendSpool(SESSION, 'hooks', hookLine('A'), ['A']);
+    await seedOtel();
+    await appendSpool(SESSION, 'hooks', hookLine('B'), ['B']);
+
+    expect(await snapshotPendingBytes(SESSION, 'logs')).toBeNull();
+    expect(await snapshotPendingBytes(SESSION, 'metrics')).toBeNull();
+    expect(await snapshotPendingBytes(SESSION, 'traces')).toBeNull();
+  });
+
+  it('isProjectStillSendable is true while bound and false after a conflict', async () => {
+    const { appendSpool, isProjectStillSendable } = await import('../spool-io.js');
+    expect(await isProjectStillSendable(SESSION, 'A')).toBe(false); // no status
+
+    await appendSpool(SESSION, 'hooks', hookLine('A'), ['A']);
+    expect(await isProjectStillSendable(SESSION, 'a')).toBe(true);
+    expect(await isProjectStillSendable(SESSION, 'B')).toBe(false);
+
+    await appendSpool(SESSION, 'hooks', hookLine('B'), ['B']);
+    expect(await isProjectStillSendable(SESSION, 'A')).toBe(false);
+  });
+});
