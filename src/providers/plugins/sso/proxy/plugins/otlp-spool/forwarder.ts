@@ -4,14 +4,14 @@ import type { SSOCredentials, JWTCredentials } from '../../../../../core/types.j
 import { isSSOCredentials, isJWTCredentials } from '../../../../../core/types.js';
 import { buildAuthHeaders } from '../../../../../core/codemie-auth-helpers.js';
 import { CODEMIE_ENDPOINTS } from '../../../sso.http-client.js';
-import { OTEL_STREAMS, type OtelStream } from './spool-paths.js';
+import { OTEL_STREAMS, type OtelStream, type SpoolStream } from './spool-paths.js';
 import {
   advanceCursor,
   markSessionEnded,
 } from './session-status.js';
 import { OtlpHookSpoolData } from '../otlp.plugin.js';
 import {
-  isProjectStillSendable,
+  isSendAllowed,
   snapshotPendingBytes,
   snapshotPendingHookRecords,
 } from './spool-io.js';
@@ -80,22 +80,24 @@ const isAuthFailure = (response: Response): boolean =>
  */
 async function send(
   sessionId: string,
-  stream: string,
+  stream: SpoolStream,
   url: string,
   body: string | Buffer,
   contentType: string,
   credentials: SSOCredentials | JWTCredentials,
-  project: string
+  project: string,
+  range: { cursor: number; end: number }
 ): Promise<SendResult> {
   if (areCredentialsStale()) {
     return 'failed';
   }
 
-  // Local re-check before every attempt: narrows the window between the locked snapshot
-  // and the wire, it does not close it. `null` = no longer sendable, nothing is fetched
-  // (the next snapshot discards under the lock).
+  // Local re-check before every attempt, per stream and per snapshotted byte range: narrows the
+  // window between the locked snapshot and the wire, it does not close it. A sealed session passes
+  // it for its hooks prefix only. `null` = no longer sendable, nothing is fetched (the next
+  // snapshot applies the policy under the lock).
   const attempt = async (): Promise<Response | null> =>
-    (await isProjectStillSendable(sessionId, project))
+    (await isSendAllowed(sessionId, stream, project, range))
       ? postToBackend(url, body, contentType, credentials, project)
       : null;
 
@@ -211,9 +213,17 @@ async function forwardHooks(
     return 'idle';
   }
 
+  if (batch.dropped > 0) {
+    logger.debug(
+      '[otlp-forwarder] hook records not provably the sealed project were not sent',
+      ...sanitizeLogArgs({ sessionId, count: batch.dropped })
+    );
+  }
+
   const url = `${baseUrl}${CODEMIE_ENDPOINTS.CLI_ANALYTICS_EVENT_HOOKS}`;
   const result = await send(
-    sessionId, 'hooks', url, payload.ndjson, 'application/x-ndjson', credentials, batch.project
+    sessionId, 'hooks', url, payload.ndjson, 'application/x-ndjson', credentials, batch.project,
+    { cursor: batch.cursor, end: batch.cursor + batch.byteLength }
   );
   if (result !== 'ok') {
     return result;
@@ -242,7 +252,8 @@ async function forwardOtelStream(
 
   const url = `${baseUrl}${OTEL_ENDPOINTS[stream]}`;
   const result = await send(
-    sessionId, stream, url, pending.bytes, 'application/x-protobuf', credentials, pending.project
+    sessionId, stream, url, pending.bytes, 'application/x-protobuf', credentials, pending.project,
+    { cursor: pending.cursor, end: pending.cursor + pending.bytes.length }
   );
   if (result !== 'ok') {
     return result;

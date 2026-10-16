@@ -162,4 +162,55 @@ describe('project gate — ingest vs forwarding', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(String(fetchMock.mock.calls[0][0])).toContain('event-hooks');
   });
+
+  describe('D. hooks seal, end to end through the real spool and forwarder', () => {
+    const aEvent = { type: 'agent.tool.end', session_id: SESSION, codemie_project_name: 'A' };
+
+    it('sends the A hooks under header A and nothing else after a switch to B', async () => {
+      const { appendSpool } = await import('../spool-io.js');
+      const { forwardSession } = await import('../forwarder.js');
+      await seedBoundA(); // A hook + OTLP chunks that arrived before the switch
+      await appendSpool(SESSION, 'hooks', hookLine('B'), ['B']);
+
+      await forwardSession(SESSION, true, credentials as never); // what the tick does for a sealed session
+      await forwardSession(SESSION, true, credentials as never);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(String(url)).toBe('https://api.example.com/v1/analytics/cli-analytics/event-hooks');
+      expect(init.headers['X-CodeMie-Project']).toBe('A');
+      expect(init.body).toBe(`${JSON.stringify(aEvent)}\n`);
+      await cursorsAtEof(Buffer.byteLength(hookLine('A') + hookLine('B')));
+    });
+
+    it('a failed send leaves the cursor, and the retry sends the same bytes', async () => {
+      const { appendSpool } = await import('../spool-io.js');
+      const { forwardSession } = await import('../forwarder.js');
+      const { readStatus } = await import('../session-status.js');
+      await seedBoundA();
+      await appendSpool(SESSION, 'hooks', hookLine('B'), ['B']);
+      fetchMock.mockResolvedValueOnce({ ok: false, status: 503 });
+
+      await forwardSession(SESSION, true, credentials as never);
+      expect((await readStatus(SESSION))?.cursors.hooks).toBe(0);
+
+      await forwardSession(SESSION, true, credentials as never);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock.mock.calls[1][1].body).toBe(fetchMock.mock.calls[0][1].body);
+      expect((await readStatus(SESSION))?.cursors.hooks).toBe(Buffer.byteLength(hookLine('A'))); // the sealed prefix only
+    });
+
+    it('a restart between the switch and the flush loses nothing: the seal is read back from disk', async () => {
+      const { appendSpool } = await import('../spool-io.js');
+      await seedBoundA();
+      await appendSpool(SESSION, 'hooks', hookLine('B'), ['B']);
+
+      vi.resetModules();
+      const { forwardSession } = await import('../forwarder.js');
+      await forwardSession(SESSION, true, credentials as never);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock.mock.calls[0][1].headers['X-CodeMie-Project']).toBe('A');
+    });
+  });
 });

@@ -241,4 +241,89 @@ describe('processSessionTick (project gate)', () => {
     const after = await stat(join(state.root, `${SESSION}.status`));
     expect(after.mtimeMs).toBe(before.mtimeMs);
   });
+
+  describe('hooks seal', () => {
+    const aLine = hookLine('A');
+    const hooks = aLine + hookLine('B');
+    const sealedStatus = async (hooksEnd: number): Promise<void> => {
+      const { writeStatus, createStatus } = await import('../session-status.js');
+      await writeStatus(SESSION, {
+        ...createStatus(),
+        project: 'A',
+        projectConflict: ['A', 'B'],
+        projectSeal: { v: 1, project: 'A', hooksEnd },
+        projectScanned: true,
+      });
+    };
+
+    it('flushes the sealed prefix hooks-only at once, with no wait tick, and discards OTLP', async () => {
+      process.env.OTLP_ALLOW_HOOKS_ONLY_FORWARD = 'true';
+      const { forwardSession } = await import('../forwarder.js');
+      const { processSessionTick } = await import('../tick-processor.js');
+      await seed({ [`${SESSION}.hooks.ndjson`]: hooks, [`${SESSION}.otel_logs.bin`]: 'abc' });
+      await sealedStatus(Buffer.byteLength(aLine));
+
+      await processSessionTick(SESSION, credentials);
+
+      expect(forwardSession).toHaveBeenCalledWith(SESSION, true, credentials);
+      const status = await readStatusRaw();
+      expect(status.waitTicks).toBe(0);
+      expect(status.cursors).toEqual({ hooks: 0, logs: 3, metrics: 0, traces: 0 });
+    });
+
+    it('with OTLP_ALLOW_HOOKS_ONLY_FORWARD=false discards the sealed session entirely and forwards nothing', async () => {
+      const { processSessionTick } = await import('../tick-processor.js');
+      await seed({ [`${SESSION}.hooks.ndjson`]: hooks, [`${SESSION}.otel_logs.bin`]: 'abc' });
+      await sealedStatus(Buffer.byteLength(aLine));
+
+      await processSessionTick(SESSION, credentials);
+
+      expect((await readStatusRaw()).cursors).toEqual({ hooks: Buffer.byteLength(hooks), logs: 3, metrics: 0, traces: 0 });
+      await expectNothingSent();
+    });
+
+    it('discards the rest of the hooks once the sealed prefix is acknowledged', async () => {
+      process.env.OTLP_ALLOW_HOOKS_ONLY_FORWARD = 'true';
+      const { processSessionTick } = await import('../tick-processor.js');
+      await seed({ [`${SESSION}.hooks.ndjson`]: hooks });
+      await sealedStatus(Buffer.byteLength(aLine));
+      const { advanceCursor } = await import('../session-status.js');
+      await advanceCursor(SESSION, 'hooks', Buffer.byteLength(aLine));
+
+      await processSessionTick(SESSION, credentials);
+
+      expect((await readStatusRaw()).cursors.hooks).toBe(Buffer.byteLength(hooks));
+      await expectNothingSent();
+    });
+
+    it.each([
+      { name: 'bound', status: { project: 'A', projectScanned: true }, flag: 'true', hooks: aLine, otel: 'abc' },
+      { name: 'conflict without a seal', status: { project: 'A', projectConflict: ['A', 'B'], projectScanned: true }, flag: 'true', hooks, otel: 'abc' },
+      { name: 'sealed, flag on', status: { project: 'A', projectConflict: ['A', 'B'], projectSeal: { v: 1 as const, project: 'A', hooksEnd: Buffer.byteLength(aLine) }, projectScanned: true }, flag: 'true', hooks, otel: 'abc' },
+      { name: 'sealed, flag off', status: { project: 'A', projectConflict: ['A', 'B'], projectSeal: { v: 1 as const, project: 'A', hooksEnd: Buffer.byteLength(aLine) }, projectScanned: true }, flag: 'false', hooks, otel: 'abc' },
+      { name: 'unbound with hooks', status: { projectScanned: true }, flag: 'true', hooks: hookLine(''), otel: 'abc' },
+    ])('tick and snapshots leave the same cursors: $name', async ({ status, flag, hooks: hooksText, otel }) => {
+      process.env.OTLP_ALLOW_HOOKS_ONLY_FORWARD = flag;
+      const { writeStatus, createStatus, readStatus } = await import('../session-status.js');
+      const { processSessionTick } = await import('../tick-processor.js');
+      const io = await import('../spool-io.js');
+      const files = { [`${SESSION}.hooks.ndjson`]: hooksText, [`${SESSION}.otel_logs.bin`]: otel };
+
+      await seed(files);
+      await writeStatus(SESSION, { ...createStatus(), ...status });
+      await processSessionTick(SESSION, credentials);
+      const viaTick = (await readStatus(SESSION))?.cursors;
+
+      await rm(join(state.root, `${SESSION}.status`));
+      await seed(files);
+      await writeStatus(SESSION, { ...createStatus(), ...status });
+      await io.snapshotPendingHookRecords(SESSION);
+      for (const stream of ['logs', 'metrics', 'traces'] as const) {
+        await io.snapshotPendingBytes(SESSION, stream);
+      }
+      const viaSnapshots = (await readStatus(SESSION))?.cursors;
+
+      expect(viaSnapshots).toEqual(viaTick);
+    });
+  });
 });

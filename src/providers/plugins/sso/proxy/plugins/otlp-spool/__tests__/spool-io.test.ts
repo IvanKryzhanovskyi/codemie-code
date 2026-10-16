@@ -326,15 +326,233 @@ describe('snapshots — project gate under the lock', () => {
     expect(await snapshotPendingBytes(SESSION, 'traces')).toBeNull();
   });
 
-  it('isProjectStillSendable is true while bound and false after a conflict', async () => {
-    const { appendSpool, isProjectStillSendable } = await import('../spool-io.js');
-    expect(await isProjectStillSendable(SESSION, 'A')).toBe(false); // no status
+  it('isSendAllowed is true for the snapshotted range while bound and false after a conflict without a seal', async () => {
+    const { appendSpool, isSendAllowed } = await import('../spool-io.js');
+    const range = { cursor: 0, end: 1 };
+    expect(await isSendAllowed(SESSION, 'hooks', 'A', range)).toBe(false); // no status
 
     await appendSpool(SESSION, 'hooks', hookLine('A'), ['A']);
-    expect(await isProjectStillSendable(SESSION, 'a')).toBe(true);
-    expect(await isProjectStillSendable(SESSION, 'B')).toBe(false);
+    expect(await isSendAllowed(SESSION, 'hooks', 'a', range)).toBe(true);
+    expect(await isSendAllowed(SESSION, 'hooks', 'B', range)).toBe(false);
+    expect(await isSendAllowed(SESSION, 'hooks', 'A', { cursor: 5, end: 9 })).toBe(false); // not the next range
 
+    // a session that never had a bound project has no seal: after a conflict nothing may go out
+    await rm(file('status'));
+    await rm(file('hooks.ndjson'));
+    await appendSpool(SESSION, 'hooks', hookLine('B') + hookLine('C'), ['B', 'C']);
+    expect(await isSendAllowed(SESSION, 'hooks', 'B', range)).toBe(false);
+    expect(await isSendAllowed(SESSION, 'hooks', 'C', range)).toBe(false);
+  });
+});
+
+describe('hooks seal — provably-original hooks survive a project switch', () => {
+  beforeEach(async () => {
+    state.root = await mkdtemp(join(tmpdir(), 'otlp-spool-seal-'));
+    delete process.env.OTLP_ALLOW_HOOKS_ONLY_FORWARD;
+    vi.resetModules(); // the once-per-session warn memory lives in the module
+  });
+  afterEach(async () => {
+    delete process.env.OTLP_ALLOW_HOOKS_ONLY_FORWARD;
+    vi.clearAllMocks();
+    await rm(state.root, { recursive: true, force: true });
+  });
+
+  const bytes = (...lines: string[]): number => Buffer.byteLength(lines.join(''));
+
+  /** Bound to A with two A hooks and a blank one, OTLP on all three streams, then a B hook. */
+  async function switchToB(): Promise<{ a1: string; blank: string; a2: string; b: string; sealEnd: number }> {
+    const { appendSpool } = await import('../spool-io.js');
+    const a1 = hookLine('A');
+    const blank = hookLine();
+    const a2 = hookLine('a');
+    const b = hookLine('B');
+    await appendSpool(SESSION, 'hooks', a1, ['A']);
+    await appendSpool(SESSION, 'hooks', blank, ['']);
+    await appendSpool(SESSION, 'hooks', a2, ['a']);
+    await appendSpool(SESSION, 'logs', Buffer.from('L')); // arrived BEFORE the conflicting hook
+    await appendSpool(SESSION, 'metrics', Buffer.from('MM'));
+    await appendSpool(SESSION, 'traces', Buffer.from('TTT'));
+    await appendSpool(SESSION, 'hooks', b, ['B']);
+    return { a1, blank, a2, b, sealEnd: bytes(a1, blank, a2) };
+  }
+
+  it('writes the seal with the exact size before the conflicting append, and before its bytes', async () => {
+    const { appendSpool } = await import('../spool-io.js');
+    const { readStatus } = await import('../session-status.js');
+    const { readFile } = await import('node:fs/promises');
+    const a = hookLine('A');
+    const b = hookLine('B');
+    await appendSpool(SESSION, 'hooks', a, ['A']);
+
+    state.failNextAppend = true;
+    await expect(appendSpool(SESSION, 'hooks', b, ['B'])).rejects.toThrow(/ENOSPC/);
+
+    const sealed = (await readStatus(SESSION))?.projectSeal;
+    expect(sealed).toEqual({ v: 1, project: 'A', hooksEnd: bytes(a) });
+    expect(await readFile(file('hooks.ndjson'), 'utf-8')).toBe(a);
+
+    await appendSpool(SESSION, 'hooks', b, ['B']); // retried batch lands after the seal
+    expect((await readStatus(SESSION))?.projectSeal).toEqual(sealed);
+    expect(await readFile(file('hooks.ndjson'), 'utf-8')).toBe(a + b);
+  });
+
+  it('writes no seal when nothing was bound or the conflict comes from a legacy scan', async () => {
+    const { appendSpool } = await import('../spool-io.js');
+    const { readStatus, writeStatus, createStatus } = await import('../session-status.js');
+    await appendSpool(SESSION, 'hooks', hookLine('A') + hookLine('B'), ['A', 'B']); // mixed first batch
+    let status = await readStatus(SESSION);
+    expect(status?.projectConflict).toEqual(['A', 'B']);
+    expect(status?.projectSeal).toBeUndefined();
+
+    await rm(file('status'));
+    await rm(file('hooks.ndjson'));
+    await writeFile(file('hooks.ndjson'), hookLine('A') + hookLine('B'));
+    await writeStatus(SESSION, createStatus());
+    await appendSpool(SESSION, 'hooks', hookLine(), []);
+    status = await readStatus(SESSION);
+    expect(status?.projectConflict).toEqual(['A', 'B']);
+    expect(status?.projectSeal).toBeUndefined();
+  });
+
+  it('sends only records that are provably A below the seal; blank and later records are consumed unsent', async () => {
+    const { snapshotPendingHookRecords } = await import('../spool-io.js');
+    const { a1, a2, b, sealEnd } = await switchToB();
+
+    const batch = await snapshotPendingHookRecords(SESSION);
+
+    expect(batch).toMatchObject({ project: 'A', cursor: 0, byteLength: sealEnd, dropped: 1 });
+    expect(batch?.records).toEqual([a1.trim(), a2.trim()]);
+    expect(batch?.records).not.toContain(b.trim());
+    expect(await snapshotPendingHookRecords(SESSION)).toEqual(batch); // same bytes on every retry
+  });
+
+  it('never sends OTLP, including chunks that arrived before the conflicting hook or after the seal', async () => {
+    const { appendSpool, snapshotPendingBytes } = await import('../spool-io.js');
+    const { readStatus } = await import('../session-status.js');
+    await switchToB();
+
+    for (const stream of ['logs', 'metrics', 'traces'] as const) {
+      expect(await snapshotPendingBytes(SESSION, stream)).toBeNull();
+    }
+    expect((await readStatus(SESSION))?.cursors).toMatchObject({ logs: 1, metrics: 2, traces: 3 });
+
+    await appendSpool(SESSION, 'logs', Buffer.from('late'));
+    expect(await snapshotPendingBytes(SESSION, 'logs')).toBeNull();
+    expect((await readStatus(SESSION))?.cursors.logs).toBe(5);
+  });
+
+  it('discards the rest of the hooks once the sealed prefix is consumed, and later hooks never flow', async () => {
+    const { appendSpool, snapshotPendingHookRecords } = await import('../spool-io.js');
+    const { readStatus, advanceCursor } = await import('../session-status.js');
+    const { a1, blank, a2, b, sealEnd } = await switchToB();
+
+    await advanceCursor(SESSION, 'hooks', sealEnd);
+    expect(await snapshotPendingHookRecords(SESSION)).toBeNull();
+    expect((await readStatus(SESSION))?.cursors.hooks).toBe(bytes(a1, blank, a2, b));
+
+    await appendSpool(SESSION, 'hooks', hookLine('A'), ['A']); // even an A hook after the conflict
+    expect(await snapshotPendingHookRecords(SESSION)).toBeNull();
+    expect((await readStatus(SESSION))?.cursors.hooks).toBe(bytes(a1, blank, a2, b, hookLine('A')));
+  });
+
+  it('completes at the file size when the seal end is beyond the file: no endless wait', async () => {
+    const { appendSpool, snapshotPendingHookRecords } = await import('../spool-io.js');
+    const { readStatus, writeStatus, advanceCursor } = await import('../session-status.js');
+    const a = hookLine('A');
+    await appendSpool(SESSION, 'hooks', a, ['A']);
+    const status = (await readStatus(SESSION))!;
+    status.projectConflict = ['A', 'B'];
+    status.projectSeal = { v: 1, project: 'A', hooksEnd: 10_000 };
+    await writeStatus(SESSION, status);
+
+    const batch = await snapshotPendingHookRecords(SESSION);
+    expect(batch).toMatchObject({ project: 'A', byteLength: bytes(a) });
+
+    await advanceCursor(SESSION, 'hooks', bytes(a));
+    expect(await snapshotPendingHookRecords(SESSION)).toBeNull();
+  });
+
+  it('consumes a partial record at the end of the sealed prefix instead of waiting for it', async () => {
+    const { appendSpool, snapshotPendingHookRecords } = await import('../spool-io.js');
+    const { advanceCursor } = await import('../session-status.js');
+    const a = hookLine('A');
+    const torn = '{"agentName":"x","hookEvent":"{\\"codemie_pro';
+    await appendSpool(SESSION, 'hooks', a, ['A']);
+    await appendSpool(SESSION, 'hooks', torn, []); // crash left a partial record
     await appendSpool(SESSION, 'hooks', hookLine('B'), ['B']);
-    expect(await isProjectStillSendable(SESSION, 'A')).toBe(false);
+
+    const first = await snapshotPendingHookRecords(SESSION);
+    expect(first?.records).toHaveLength(1);
+    await advanceCursor(SESSION, 'hooks', first!.byteLength);
+
+    const second = await snapshotPendingHookRecords(SESSION);
+    expect(second).toMatchObject({ records: [], byteLength: Buffer.byteLength(torn) });
+    await advanceCursor(SESSION, 'hooks', Buffer.byteLength(a) + second!.byteLength);
+    expect(await snapshotPendingHookRecords(SESSION)).toBeNull();
+  });
+
+  it('isSendAllowed lets a sealed session send its hooks prefix, never an OTLP stream or a wider range', async () => {
+    const { isSendAllowed } = await import('../spool-io.js');
+    const { sealEnd } = await switchToB();
+    const range = { cursor: 0, end: sealEnd };
+
+    expect(await isSendAllowed(SESSION, 'hooks', 'A', range)).toBe(true);
+    expect(await isSendAllowed(SESSION, 'hooks', 'a', range)).toBe(true);
+    expect(await isSendAllowed(SESSION, 'hooks', 'B', range)).toBe(false);
+    expect(await isSendAllowed(SESSION, 'hooks', 'A', { cursor: 0, end: sealEnd + 1 })).toBe(false);
+    expect(await isSendAllowed(SESSION, 'hooks', 'A', { cursor: 3, end: sealEnd })).toBe(false);
+    for (const stream of ['logs', 'metrics', 'traces'] as const) {
+      expect(await isSendAllowed(SESSION, stream, 'A', { cursor: 0, end: 1 })).toBe(false);
+    }
+  });
+
+  it('with OTLP_ALLOW_HOOKS_ONLY_FORWARD=false the sealed prefix is discarded too, as before', async () => {
+    process.env.OTLP_ALLOW_HOOKS_ONLY_FORWARD = 'false';
+    const { snapshotPendingHookRecords, isSendAllowed } = await import('../spool-io.js');
+    const { readStatus } = await import('../session-status.js');
+    const { a1, blank, a2, b, sealEnd } = await switchToB();
+
+    expect(await isSendAllowed(SESSION, 'hooks', 'A', { cursor: 0, end: sealEnd })).toBe(false);
+    expect(await snapshotPendingHookRecords(SESSION)).toBeNull();
+    expect((await readStatus(SESSION))?.cursors.hooks).toBe(bytes(a1, blank, a2, b));
+  });
+
+  it('drops a seal that points into an older incarnation of the hooks file, keeping the conflict', async () => {
+    const { appendSpool } = await import('../spool-io.js');
+    const { readStatus } = await import('../session-status.js');
+    await switchToB();
+    expect((await readStatus(SESSION))?.projectSeal).toBeDefined();
+
+    await rm(file('hooks.ndjson'));
+    await appendSpool(SESSION, 'hooks', hookLine('A'), ['A']);
+
+    const status = await readStatus(SESSION);
+    expect(status?.projectSeal).toBeUndefined();
+    expect(status?.projectConflict).toEqual(['A', 'B']);
+    expect(status?.cursors.hooks).toBe(0);
+  });
+
+  it('keeps the seal across a daemon restart', async () => {
+    const { sealEnd } = await switchToB();
+
+    vi.resetModules();
+    const { readStatus } = await import('../session-status.js');
+    expect((await readStatus(SESSION))?.projectSeal).toEqual({ v: 1, project: 'A', hooksEnd: sealEnd });
+  });
+
+  it('warns once at the switch and once when the unsent backlog is discarded, not on every tick', async () => {
+    const { logger } = await import('@/utils/logger.js');
+    const { snapshotPendingBytes } = await import('../spool-io.js');
+    await switchToB();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+
+    await snapshotPendingBytes(SESSION, 'logs');
+    await snapshotPendingBytes(SESSION, 'metrics');
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+
+    const { appendSpool } = await import('../spool-io.js');
+    await appendSpool(SESSION, 'logs', Buffer.from('more'));
+    await snapshotPendingBytes(SESSION, 'logs');
+    expect(logger.warn).toHaveBeenCalledTimes(2);
   });
 });

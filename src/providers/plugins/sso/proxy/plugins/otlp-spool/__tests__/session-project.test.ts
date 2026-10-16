@@ -23,8 +23,11 @@ vi.mock('../spool-paths.js', async (importOriginal) => {
 import {
   applyProjectDecision,
   decideProject,
+  evaluateProjectPolicy,
   hookEventProjectNames,
+  hookRecordIsProject,
   isSendableProjectName,
+  parseProjectSeal,
   projectGate,
 } from '../session-project.js';
 import { createStatus, type SessionStatus } from '../session-status.js';
@@ -158,5 +161,142 @@ describe('status persistence', () => {
     expect(status?.project).toBeUndefined();
     expect(status?.projectConflict).toBeUndefined();
     expect(status?.projectScanned).toBeUndefined();
+  });
+
+  it('reads a status written before the seal existed, and keeps a seal across a cursor advance', async () => {
+    const { readStatus, writeStatus, advanceCursor } = await import('../session-status.js');
+    await writeFile(
+      join(state.root, 's3.status'),
+      JSON.stringify({ cursors: { hooks: 3 }, project: 'A', projectConflict: ['A', 'B'], projectScanned: true })
+    );
+    expect((await readStatus('s3'))?.projectSeal).toBeUndefined(); // old status: today's discard
+
+    await writeStatus('s4', {
+      ...createStatus(),
+      project: 'A',
+      projectConflict: ['A', 'B'],
+      projectSeal: { v: 1, project: 'A', hooksEnd: 40 },
+    });
+    await advanceCursor('s4', 'hooks', 7);
+    expect((await readStatus('s4'))?.projectSeal).toEqual({ v: 1, project: 'A', hooksEnd: 40 });
+  });
+
+  it('ignores a malformed seal on disk instead of trusting it', async () => {
+    const { readStatus } = await import('../session-status.js');
+    const base = { cursors: {}, project: 'A', projectConflict: ['A', 'B'] };
+    const bad: unknown[] = [
+      { v: 2, project: 'A', hooksEnd: 1 },
+      { project: 'A', hooksEnd: 1 },
+      { v: 1, project: '', hooksEnd: 1 },
+      { v: 1, project: 'Проект', hooksEnd: 1 },
+      { v: 1, project: 'A', hooksEnd: -1 },
+      { v: 1, project: 'A', hooksEnd: 1.5 },
+      { v: 1, project: 'A', hooksEnd: '9' },
+      { v: 1, project: 'C', hooksEnd: 1 }, // not a project of the conflict
+      'seal',
+    ];
+    for (const [index, seal] of bad.entries()) {
+      await writeFile(join(state.root, `bad${index}.status`), JSON.stringify({ ...base, projectSeal: seal }));
+      expect((await readStatus(`bad${index}`))?.projectSeal).toBeUndefined();
+    }
+    await writeFile(
+      join(state.root, 'noconflict.status'),
+      JSON.stringify({ cursors: {}, project: 'A', projectSeal: { v: 1, project: 'A', hooksEnd: 1 } })
+    );
+    expect((await readStatus('noconflict'))?.projectSeal).toBeUndefined(); // a seal needs a conflict
+  });
+});
+
+describe('hooks seal: decision, validation and record proof', () => {
+  it('seals only when a bound session turns into a conflict, at the size before the append', () => {
+    const bound = withProject('A');
+    applyProjectDecision(bound, { action: 'conflict', names: ['A', 'B'] }, 120);
+    expect(bound.projectSeal).toEqual({ v: 1, project: 'A', hooksEnd: 120 });
+
+    const unbound = createStatus();
+    applyProjectDecision(unbound, { action: 'conflict', names: ['A', 'B'] }, 120);
+    expect(unbound.projectSeal).toBeUndefined(); // nothing was bound: no provable prefix
+
+    const legacy = withProject('A');
+    applyProjectDecision(legacy, { action: 'conflict', names: ['A', 'B'] }); // legacy scan passes no size
+    expect(legacy.projectSeal).toBeUndefined();
+
+    const once = withProject('A');
+    applyProjectDecision(once, { action: 'conflict', names: ['A', 'B'] }, 10);
+    applyProjectDecision(once, { action: 'conflict', names: ['A', 'C'] }, 99);
+    expect(once.projectSeal?.hooksEnd).toBe(10);
+  });
+
+  it('parseProjectSeal accepts exactly what applyProjectDecision writes', () => {
+    expect(parseProjectSeal({ v: 1, project: 'a', hooksEnd: 0 }, ['A', 'B'])).toEqual({ v: 1, project: 'a', hooksEnd: 0 });
+    expect(parseProjectSeal({ v: 1, project: 'A', hooksEnd: 5 }, undefined)).toBeUndefined();
+    expect(parseProjectSeal(null, ['A'])).toBeUndefined();
+  });
+
+  const record = (event: Record<string, unknown>): string =>
+    JSON.stringify({ agentName: 'x', hookEvent: JSON.stringify(event) });
+
+  it('hookRecordIsProject proves A only when every name in the record is A', () => {
+    expect(hookRecordIsProject(record({ codemie_project_name: 'A' }), 'a')).toBe(true);
+    expect(hookRecordIsProject(record({ codemie_project_name: 'A', raw: { codemie_project_name: 'A' } }), 'A')).toBe(true);
+    expect(hookRecordIsProject(record({ codemie_project_name: 'B' }), 'A')).toBe(false);
+    expect(hookRecordIsProject(record({ codemie_project_name: '' }), 'A')).toBe(false);
+    expect(hookRecordIsProject(record({ type: 'x' }), 'A')).toBe(false);
+    expect(hookRecordIsProject(record({ codemie_project_name: 'A', raw: { codemie_project_name: 'B' } }), 'A')).toBe(false);
+    expect(hookRecordIsProject('not json', 'A')).toBe(false);
+  });
+});
+
+describe('evaluateProjectPolicy', () => {
+  const sealed = (cursor = 0, hooksEnd = 50): SessionStatus => ({
+    ...createStatus(),
+    project: 'A',
+    projectConflict: ['A', 'B'],
+    projectSeal: { v: 1, project: 'A', hooksEnd },
+    cursors: { hooks: cursor, logs: 0, metrics: 0, traces: 0 },
+  });
+  const input = { hooksSize: 80, hooksOnlyAllowed: true };
+
+  it('bound: everything goes out under the project', () => {
+    const policy = evaluateProjectPolicy(withProject('A'), input);
+    expect(policy).toMatchObject({ state: 'bound', sealed: false });
+    expect(policy.hooks).toEqual({ kind: 'send', project: 'A' });
+    expect(policy.otel).toEqual({ kind: 'send', project: 'A' });
+  });
+
+  it('unbound: undecided while there are no hooks, discarded once hooks exist', () => {
+    expect(evaluateProjectPolicy(createStatus(), { ...input, hooksSize: 0 })).toMatchObject({
+      state: 'undecided',
+      hooks: { kind: 'hold' },
+      otel: { kind: 'hold' },
+    });
+    expect(evaluateProjectPolicy(createStatus(), input)).toMatchObject({
+      state: 'unbound',
+      hooks: { kind: 'discard' },
+      otel: { kind: 'discard' },
+    });
+  });
+
+  it('conflict with a live seal: only the hooks prefix, bounded by the seal and the file size', () => {
+    expect(evaluateProjectPolicy(sealed(), input)).toEqual({
+      state: 'conflict',
+      sealed: true,
+      hooks: { kind: 'send', project: 'A', limit: 50, onlyProject: 'A' },
+      otel: { kind: 'discard' },
+    });
+    const clamped = evaluateProjectPolicy(sealed(0, 10_000), { ...input, hooksSize: 60 });
+    expect(clamped.hooks).toMatchObject({ kind: 'send', limit: 60 });
+  });
+
+  it('conflict: everything is discarded without a seal, with the flag off, or once the prefix is done', () => {
+    const noSeal = { ...sealed(), projectSeal: undefined };
+    expect(evaluateProjectPolicy(noSeal, input)).toMatchObject({ hooks: { kind: 'discard' }, otel: { kind: 'discard' }, reason: 'no-seal' });
+    expect(evaluateProjectPolicy(sealed(), { ...input, hooksOnlyAllowed: false })).toMatchObject({
+      hooks: { kind: 'discard' },
+      otel: { kind: 'discard' },
+      reason: 'hooks-only-forwarding-disabled',
+    });
+    expect(evaluateProjectPolicy(sealed(50), input)).toMatchObject({ hooks: { kind: 'discard' }, reason: 'seal-flushed', sealed: false });
+    expect(evaluateProjectPolicy(sealed(5, 50), { ...input, hooksSize: 5 })).toMatchObject({ reason: 'seal-flushed' });
   });
 });
