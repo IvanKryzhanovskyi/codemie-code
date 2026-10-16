@@ -229,7 +229,7 @@ describe('forwardSession (project header)', () => {
 
     expect(fetchMock).not.toHaveBeenCalled();
     expect(advanceCursorMock).not.toHaveBeenCalled();
-    expect(isSendAllowedMock).toHaveBeenNthCalledWith(1, 's1', 'hooks', 'Proj A', { cursor: 0, end: 10 });
+    expect(isSendAllowedMock).toHaveBeenNthCalledWith(1, 's1', 'hooks', 'Proj A', { cursor: 0, end: 10, filtered: false });
   });
 
   it('checks every OTLP stream under its own name and byte range, so a hooks-only seal cannot cover it', async () => {
@@ -241,10 +241,27 @@ describe('forwardSession (project header)', () => {
 
     await forwardSession('s1', false, credentials);
 
-    expect(isSendAllowedMock).toHaveBeenCalledWith('s1', 'logs', 'Proj A', { cursor: 4, end: 14 });
+    expect(isSendAllowedMock).toHaveBeenCalledWith('s1', 'logs', 'Proj A', { cursor: 4, end: 14, filtered: false });
     expect(fetchMock).toHaveBeenCalledTimes(1); // the hooks batch only
     expect(String(fetchMock.mock.calls[0][0])).toContain('/event-hooks');
     expect(advanceCursorMock).not.toHaveBeenCalledWith('s1', 'logs', expect.anything());
+  });
+
+  it('tells the pre-send check whether the batch was built through the sealed-project filter', async () => {
+    snapshotPendingHookRecordsMock.mockResolvedValue({
+      project: 'Proj A',
+      records: [spoolLine({ type: 'agent.tool.end', session_id: 's1' })],
+      cursor: 0,
+      byteLength: 50,
+      dropped: 0,
+      filtered: true,
+    });
+    fetchMock.mockResolvedValue({ ok: true, status: 200 });
+    const { forwardSession } = await import('../forwarder.js');
+
+    await forwardSession('s1', true, credentials);
+
+    expect(isSendAllowedMock).toHaveBeenCalledWith('s1', 'hooks', 'Proj A', { cursor: 0, end: 50, filtered: true });
   });
 
   it('advances over a sealed batch with nothing provable to send, without a request', async () => {

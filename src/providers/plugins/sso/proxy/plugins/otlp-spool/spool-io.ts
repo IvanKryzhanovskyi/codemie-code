@@ -211,14 +211,18 @@ async function gateStreamLocked(
 
 /**
  * Locked re-check right before a request: the policy still lets `stream` go out under `project`,
- * and the exact byte range that was snapshotted is still the next one to send. Pure read; a sealed
- * session answers true for its hooks prefix only, never for an OTLP stream.
+ * the exact byte range that was snapshotted is still the next one to send, and the payload that was
+ * built from it was built under the same rule the policy applies now. A snapshot of a bound session
+ * is unfiltered (blank-named hooks included), so it is stale once a conflict seals the session:
+ * `filtered` must match what the policy demands now, otherwise nothing is sent, the cursor stays and
+ * the next tick re-snapshots through the filter. Pure read; a sealed session answers true for its
+ * filtered hooks prefix only, never for an OTLP stream.
  */
 export async function isSendAllowed(
   sessionId: string,
   stream: SpoolStream,
   project: string,
-  range: { cursor: number; end: number }
+  range: { cursor: number; end: number; filtered: boolean }
 ): Promise<boolean> {
   return withSessionLock(sessionId, async () => {
     const status = await readStatus(sessionId);
@@ -233,6 +237,7 @@ export async function isSendAllowed(
       return false;
     }
     if (status.cursors[stream] !== range.cursor) return false;
+    if (Boolean(streamPolicy.onlyProject) !== range.filtered) return false;
     return streamPolicy.limit === undefined || range.end <= streamPolicy.limit;
   });
 }
@@ -343,6 +348,8 @@ export interface PendingHookBatch {
   byteLength: number;
   /** Records read but not provably the sealed project's (sealed session only). */
   dropped: number;
+  /** The records went through the only-this-project filter (sealed session). Bound snapshots are not filtered. */
+  filtered: boolean;
 }
 
 /**
@@ -373,7 +380,7 @@ export async function snapshotPendingHookRecords(
       // belong to the next batch), so consume it instead of waiting for it forever.
       return gate.limit === undefined
         ? null
-        : { project: gate.project, cursor, records: [], byteLength: pending.length, dropped: 1 };
+        : { project: gate.project, cursor, records: [], byteLength: pending.length, dropped: 1, filtered: true };
     }
 
     const complete = pending.subarray(0, lastNewline + 1);
@@ -390,6 +397,13 @@ export async function snapshotPendingHookRecords(
       records = kept;
     }
 
-    return { project: gate.project, cursor, records, byteLength: complete.length, dropped };
+    return {
+      project: gate.project,
+      cursor,
+      records,
+      byteLength: complete.length,
+      dropped,
+      filtered: Boolean(gate.onlyProject),
+    };
   });
 }

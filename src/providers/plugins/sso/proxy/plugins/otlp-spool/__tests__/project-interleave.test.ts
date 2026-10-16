@@ -30,6 +30,16 @@ vi.mock('../spool-paths.js', async (importOriginal) => {
     statusFile: (sessionId: string): string => pathJoin(state.root, sessionId + '.status'),
   };
 });
+// The only seam between the hooks snapshot and the locked pre-send check: `send()` asks this right after
+// the snapshot, so a hook armed here can queue a spool append that the next locked call must follow.
+const authHook = vi.hoisted(() => ({ onStaleCheck: undefined as undefined | (() => void) }));
+vi.mock('../auth-state.js', () => ({
+  areCredentialsStale: (): boolean => {
+    authHook.onStaleCheck?.();
+    return false;
+  },
+  markCredentialsStale: vi.fn(),
+}));
 vi.mock('@/cli/commands/proxy/daemon-manager.js', () => ({ readState: readStateMock }));
 vi.mock('@/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -64,6 +74,7 @@ describe('project gate — ingest vs forwarding', () => {
   });
 
   afterEach(async () => {
+    authHook.onStaleCheck = undefined;
     vi.unstubAllGlobals();
     await rm(state.root, { recursive: true, force: true });
   });
@@ -198,6 +209,73 @@ describe('project gate — ingest vs forwarding', () => {
       expect(fetchMock).toHaveBeenCalledTimes(2);
       expect(fetchMock.mock.calls[1][1].body).toBe(fetchMock.mock.calls[0][1].body);
       expect((await readStatus(SESSION))?.cursors.hooks).toBe(Buffer.byteLength(hookLine('A'))); // the sealed prefix only
+    });
+
+    describe('E. a conflict persisted after an unfiltered bound snapshot was built', () => {
+      const aLine = hookLine('A');
+      const blankLine = hookLine(''); // not provably A's: must never leave once the session is sealed
+      const bLine = hookLine('B');
+
+      async function seedBoundWithBlank(): Promise<void> {
+        const { appendSpool } = await import('../spool-io.js');
+        await appendSpool(SESSION, 'hooks', aLine, ['A']);
+        await appendSpool(SESSION, 'hooks', blankLine, ['']);
+      }
+
+      async function expectOnlyProvablyAFlushed(callIndex: number): Promise<void> {
+        const { readStatus } = await import('../session-status.js');
+        const [url, init] = fetchMock.mock.calls[callIndex];
+        expect(String(url)).toContain('event-hooks');
+        expect(init.headers['X-CodeMie-Project']).toBe('A');
+        expect(init.body).toBe(`${JSON.stringify({ type: 'agent.tool.end', session_id: SESSION, codemie_project_name: 'A' })}\n`);
+        expect((await readStatus(SESSION))?.cursors.hooks).toBe(Buffer.byteLength(aLine + blankLine));
+      }
+
+      it('between the snapshot and the pre-send check: nothing is posted, the cursor stays, the next pass sends only A', async () => {
+        const { appendSpool } = await import('../spool-io.js');
+        const { forwardSession } = await import('../forwarder.js');
+        const { readStatus } = await import('../session-status.js');
+        await seedBoundWithBlank();
+        let conflictAppend: Promise<void> | undefined;
+        authHook.onStaleCheck = (): void => {
+          authHook.onStaleCheck = undefined;
+          conflictAppend = appendSpool(SESSION, 'hooks', bLine, ['B']); // queued on the lock before the check
+        };
+
+        await forwardSession(SESSION, true, credentials as never);
+        await conflictAppend;
+
+        expect(fetchMock).not.toHaveBeenCalled();
+        const status = await readStatus(SESSION);
+        expect(status?.cursors.hooks).toBe(0);
+        expect(status?.projectSeal).toEqual({ v: 1, project: 'A', hooksEnd: Buffer.byteLength(aLine + blankLine) });
+
+        await forwardSession(SESSION, true, credentials as never); // re-snapshot through the filter
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        await expectOnlyProvablyAFlushed(0);
+      });
+
+      it('on the 401 retry: the retry built from the same bound snapshot is refused, then only A is sent', async () => {
+        const { appendSpool } = await import('../spool-io.js');
+        const { forwardSession } = await import('../forwarder.js');
+        await seedBoundWithBlank();
+        fetchMock.mockReset();
+        fetchMock.mockImplementationOnce(async () => {
+          await appendSpool(SESSION, 'hooks', bLine, ['B']); // conflict lands while the first attempt is on the wire
+          return { ok: false, status: 401 };
+        });
+        fetchMock.mockResolvedValue({ ok: true, status: 200 });
+
+        await forwardSession(SESSION, true, credentials as never);
+
+        expect(fetchMock).toHaveBeenCalledTimes(1); // the 401 retry never reached the wire
+        const { readStatus } = await import('../session-status.js');
+        expect((await readStatus(SESSION))?.cursors.hooks).toBe(0);
+
+        await forwardSession(SESSION, true, credentials as never);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        await expectOnlyProvablyAFlushed(1);
+      });
     });
 
     it('a restart between the switch and the flush loses nothing: the seal is read back from disk', async () => {

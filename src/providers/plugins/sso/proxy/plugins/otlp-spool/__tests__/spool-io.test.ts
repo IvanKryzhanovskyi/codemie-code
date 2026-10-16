@@ -328,13 +328,14 @@ describe('snapshots — project gate under the lock', () => {
 
   it('isSendAllowed is true for the snapshotted range while bound and false after a conflict without a seal', async () => {
     const { appendSpool, isSendAllowed } = await import('../spool-io.js');
-    const range = { cursor: 0, end: 1 };
+    const range = { cursor: 0, end: 1, filtered: false };
     expect(await isSendAllowed(SESSION, 'hooks', 'A', range)).toBe(false); // no status
 
     await appendSpool(SESSION, 'hooks', hookLine('A'), ['A']);
     expect(await isSendAllowed(SESSION, 'hooks', 'a', range)).toBe(true);
     expect(await isSendAllowed(SESSION, 'hooks', 'B', range)).toBe(false);
-    expect(await isSendAllowed(SESSION, 'hooks', 'A', { cursor: 5, end: 9 })).toBe(false); // not the next range
+    expect(await isSendAllowed(SESSION, 'hooks', 'A', { ...range, cursor: 5, end: 9 })).toBe(false); // not the next range
+    expect(await isSendAllowed(SESSION, 'hooks', 'A', { ...range, filtered: true })).toBe(false); // bound: unfiltered only
 
     // a session that never had a bound project has no seal: after a conflict nothing may go out
     await rm(file('status'));
@@ -494,16 +495,42 @@ describe('hooks seal — provably-original hooks survive a project switch', () =
   it('isSendAllowed lets a sealed session send its hooks prefix, never an OTLP stream or a wider range', async () => {
     const { isSendAllowed } = await import('../spool-io.js');
     const { sealEnd } = await switchToB();
-    const range = { cursor: 0, end: sealEnd };
+    const range = { cursor: 0, end: sealEnd, filtered: true };
 
     expect(await isSendAllowed(SESSION, 'hooks', 'A', range)).toBe(true);
     expect(await isSendAllowed(SESSION, 'hooks', 'a', range)).toBe(true);
     expect(await isSendAllowed(SESSION, 'hooks', 'B', range)).toBe(false);
-    expect(await isSendAllowed(SESSION, 'hooks', 'A', { cursor: 0, end: sealEnd + 1 })).toBe(false);
-    expect(await isSendAllowed(SESSION, 'hooks', 'A', { cursor: 3, end: sealEnd })).toBe(false);
+    expect(await isSendAllowed(SESSION, 'hooks', 'A', { ...range, end: sealEnd + 1 })).toBe(false);
+    expect(await isSendAllowed(SESSION, 'hooks', 'A', { ...range, cursor: 3 })).toBe(false);
     for (const stream of ['logs', 'metrics', 'traces'] as const) {
-      expect(await isSendAllowed(SESSION, stream, 'A', { cursor: 0, end: 1 })).toBe(false);
+      expect(await isSendAllowed(SESSION, stream, 'A', { cursor: 0, end: 1, filtered: false })).toBe(false);
     }
+  });
+
+  it('isSendAllowed refuses a stale unfiltered snapshot once the session is sealed, keeping the cursor', async () => {
+    const { appendSpool, snapshotPendingHookRecords, isSendAllowed } = await import('../spool-io.js');
+    const { readStatus } = await import('../session-status.js');
+    const a1 = hookLine('A');
+    const blank = hookLine();
+    await appendSpool(SESSION, 'hooks', a1, ['A']);
+    await appendSpool(SESSION, 'hooks', blank, ['']);
+
+    const bound = await snapshotPendingHookRecords(SESSION); // built while bound: unfiltered, blank included
+    expect(bound).toMatchObject({ project: 'A', filtered: false });
+    expect(bound?.records).toEqual([a1.trim(), blank.trim()]);
+
+    await appendSpool(SESSION, 'hooks', hookLine('B'), ['B']); // conflict persisted after the snapshot
+    const range = { cursor: bound!.cursor, end: bound!.cursor + bound!.byteLength, filtered: bound!.filtered };
+
+    expect(await isSendAllowed(SESSION, 'hooks', 'A', range)).toBe(false);
+    expect((await readStatus(SESSION))?.cursors.hooks).toBe(0); // nothing acknowledged or lost
+
+    const sealed = await snapshotPendingHookRecords(SESSION); // the next pass re-snapshots through the filter
+    expect(sealed).toMatchObject({ project: 'A', filtered: true, cursor: 0, dropped: 1 });
+    expect(sealed?.records).toEqual([a1.trim()]);
+    expect(
+      await isSendAllowed(SESSION, 'hooks', 'A', { cursor: 0, end: sealed!.byteLength, filtered: sealed!.filtered })
+    ).toBe(true);
   });
 
   it('with OTLP_ALLOW_HOOKS_ONLY_FORWARD=false the sealed prefix is discarded too, as before', async () => {
@@ -512,7 +539,7 @@ describe('hooks seal — provably-original hooks survive a project switch', () =
     const { readStatus } = await import('../session-status.js');
     const { a1, blank, a2, b, sealEnd } = await switchToB();
 
-    expect(await isSendAllowed(SESSION, 'hooks', 'A', { cursor: 0, end: sealEnd })).toBe(false);
+    expect(await isSendAllowed(SESSION, 'hooks', 'A', { cursor: 0, end: sealEnd, filtered: true })).toBe(false);
     expect(await snapshotPendingHookRecords(SESSION)).toBeNull();
     expect((await readStatus(SESSION))?.cursors.hooks).toBe(bytes(a1, blank, a2, b));
   });

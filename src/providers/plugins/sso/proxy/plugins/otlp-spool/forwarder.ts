@@ -86,7 +86,7 @@ async function send(
   contentType: string,
   credentials: SSOCredentials | JWTCredentials,
   project: string,
-  range: { cursor: number; end: number }
+  range: { cursor: number; end: number; filtered: boolean }
 ): Promise<SendResult> {
   if (areCredentialsStale()) {
     return 'failed';
@@ -223,7 +223,7 @@ async function forwardHooks(
   const url = `${baseUrl}${CODEMIE_ENDPOINTS.CLI_ANALYTICS_EVENT_HOOKS}`;
   const result = await send(
     sessionId, 'hooks', url, payload.ndjson, 'application/x-ndjson', credentials, batch.project,
-    { cursor: batch.cursor, end: batch.cursor + batch.byteLength }
+    { cursor: batch.cursor, end: batch.cursor + batch.byteLength, filtered: batch.filtered === true }
   );
   if (result !== 'ok') {
     return result;
@@ -253,7 +253,7 @@ async function forwardOtelStream(
   const url = `${baseUrl}${OTEL_ENDPOINTS[stream]}`;
   const result = await send(
     sessionId, stream, url, pending.bytes, 'application/x-protobuf', credentials, pending.project,
-    { cursor: pending.cursor, end: pending.cursor + pending.bytes.length }
+    { cursor: pending.cursor, end: pending.cursor + pending.bytes.length, filtered: false }
   );
   if (result !== 'ok') {
     return result;
