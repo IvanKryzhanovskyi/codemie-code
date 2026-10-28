@@ -239,3 +239,63 @@ Claude Code fires 16 hook events (`HOOK_EVENTS` in that connector). `evaluate()`
 The `PostCompact` hook entry is also the one exception to every other event's synchronous, 30s-timeout entry: `connectors/claude-code-otlp.ts`'s `buildCodemieEntry()` gives it `async: true` plus `CODEMIE_POST_COMPACT_HOOK_TIMEOUT_SECONDS` (90s) instead of `CODEMIE_HOOK_TIMEOUT_SECONDS` (30s) — `async` keeps Claude Code, and the user's own turn, from ever waiting on this hook; the longer `timeout` is what keeps Claude Code from killing the subprocess before the wait above (plus the brief lock-held merge/send/commit after it) can finish. No other event can be `async`, because several of them depend on Claude Code waiting synchronously for a `ForwardDecision`-driven outcome (`UserPromptSubmit`'s SSO re-auth `block` decision being the clearest example).
 
 See `docs/ARCHITECTURE-PROXY.md` for the proxy/daemon layer this hands off to, and `otlp-spool/` (`src/providers/plugins/sso/proxy/plugins/otlp-spool/`) for session completeness gating and draining — both already agent-agnostic and not something a new adapter needs to touch.
+
+## 7. Evidence contract, classification and holds (EPMCDME-16440)
+
+Applies to adapters that override `resolveEvidenceInputs()` (today only `claude-code-otlp`). Adapters that return `undefined` keep the legacy, unmarked path unchanged. The CLI only emits evidence; the backend decides destinations and access.
+
+### 7.1 Hook-time evidence record
+
+- **Location and key.** One JSON file per session in the `evidence/` directory under the CodeMie home (`evidenceDir()`, `record-store.ts`). The file name is `recordKey(apiIdentity, ownerHash, sessionId)`: a SHA-256 over length-prefixed parts, so no raw URL, e-mail or session id appears in file names.
+- **Fields.** `session_id`, `launch_mode` (managed|native), `routed_via_codemie`, `routing_proof`, `organization`, `project`, `project_source` (linked_folder|profile|none), `repo_key`, `api_identity`, `owner_hash`, `profile`, plus `schema`, `created`, `last_used`.
+- **Atomic publication.** Temp file, then `fs.link` to the final name; the loser of a race reads the winner back. Mode 0600.
+- **Never repaired.** The first hook writes the record and it is then frozen. A mismatched key, other schema, corrupt file or oversized field yields `stamp_invalid`; the hook never rewrites it. Later hooks only read it and `touch` `last_used` at most once per day. A resumed session with a changed project, organization or routing still sends the original evidence.
+- **Envelope marker.** Stamped hook lines carry `evidence_v: 1` on the spool line (`OtlpHookSpoolData`), never in event bodies. The marker is sticky once a pending line has it; a marked line without a valid record is `stamp_invalid` under every capability.
+- **Source rules.** Organization comes from the key `oauthAccount.organizationName` in Claude's `.claude.json` (the value is never logged). Project is resolved once at stamping (env, pin, config) and frozen; an empty project sends no `X-CodeMie-Project` header. `repo_key` is the credential-free `host[:port]/path` form (`repoKeyFromRemote`), mirroring the backend normalization. Untracked projects stamp and spool nothing.
+
+### 7.2 Routing proof and URL roles
+
+Three URLs differ and must not be conflated: the **model upstream** (`CODEMIE_TARGET_API_URL`, preserved by `setupProxy`), the **local proxy** (loopback `CODEMIE_BASE_URL` the agent talks to) and the **analytics backend** (daemon `targetUrl`/`url`, used by `forwarder.resolveBaseUrl`). The upstream is never required to equal the analytics host; no hostname inference.
+
+`routing_proof` is `proven` only when the proxy ran under the real provider/auth setup, the effective Anthropic endpoint (settings.json `env` over process env) is the proven local proxy, and the model target validates against the configured provider (managed), or the actual configured model route is derived (native). Otherwise `unproven`: the record classifies `unknown` (basis `routing_unproven`, local only, not in the sent enum), never `personal`.
+
+### 7.3 Classify / decide seam
+
+`classify(evidence, policy)` (`evidence/classify.ts`) returns a class and a sent basis (`routed`, `org_match`, `org_no_match`, `org_list_empty`, `no_org`, `policy_unavailable`). `decide()` maps it to `forward|suppress|withhold` through an optional consumer. `classification.ts` is the single decision site for the tick and the forwarder 409 path. `setClassificationConsumer(c)` is the plug-in point for opt-out (#711); the default forwards everything. `suppress` is a non-destructive no-op (nothing sent, no cursor, hold or loss change) and has no retention bound until #711 defines its terminal outcome. `withhold` becomes the hold `classification_unresolved`.
+
+**Policy/capability cache** (`policy-cache.ts`, one `*.policy.json` per identity+profile namespace beside the records): a fetched policy is usable for 24 h; a failed refresh backs off 5 min; `legacy` capability is recorded only from an authenticated 404 and re-probed after 1 h; unknown capability is treated as possibly evidence-capable. **Sticky Personal (I5):** a first determinate `personal` verdict is stored (`verdict-store.ts`) and replaced only when class or policy version changes. Without a usable policy it is sent with full evidence or held `personal_not_forwardable`; evidence is never stripped.
+
+### 7.4 Sending: structural proof and typed outcomes
+
+Evidence sends add `X-CodeMie-Session-Id`, `-Routed-Via-CodeMie`, `-Organization`, `-Project-Source`, `-Subscription-Type`, `-Policy-Version`, `-Repo-Remote` and `X-CodeMie-Project`, all from the frozen record. Payload bytes are never rewritten. Before sending, OTLP bodies pass a structural proof (`proveRange`: session, project, signal) and hook lines `proveHookLines`; only the **verified prefix** is sent, byte-identical, and the cursor advances by that length. An unverified remainder holds (`otlp_unparseable`, or a specific reason via `noteStreamHold`).
+
+`response.ts` is the single response consumer; `decodeResponse` yields a `SendOutcome.kind`: `ok`, `discarded` (hooks `accepted:0` with a reason, or OTLP `rejected>0`), `stale` (409 `stale_policy`), `retry` (5xx, network), `failed`, `auth-expired`. `ok` and `discarded` advance exactly the request range; the others retain. A `stale` outcome forces a policy refresh and resends once only if the version changed. The latest acknowledged discard reason is persisted as `lastDiscard` in session status.
+
+### 7.5 Hold and loss reasons
+
+Every holding path has a named reason. Holds live in session status (`holds.session` or per stream); the first-hold time survives restarts and reason changes. Past `heldRetentionMs()` (`OTLP_HELD_RETENTION_MINUTES`, default 1440) the pending bytes are discarded and recorded as `lastLoss` (persisted) plus a `logger.warn`.
+
+| Reason | Meaning | Recorded |
+|---|---|---|
+| `stamp_pending` | marked/new OTLP-only session, record not yet visible | hold; on expiry loss `no_evidence_timeout` |
+| `stamp_invalid` | record corrupt, mismatched key or unreadable; marked line without a valid record | hold; loss with same reason |
+| `evidence_capacity` | record store at cap with every record pinned | hook warn, nothing enqueued; session hold/loss |
+| `personal_not_forwardable` | sticky Personal, no usable policy, not full-evidence capable | hold; loss |
+| `classification_unresolved` | consumer `withhold` or classification not determinable | hold; loss |
+| `session_mismatch`, `session_id_absent` | session id missing or differing from the record | hold; loss |
+| `project_conflict` | hook project differs from the bound/record project | hold; loss |
+| `otlp_unparseable` | OTLP range not provable and no more specific reason | stream hold; loss |
+| `no_evidence_timeout` | loss only: an expired `stamp_pending` | `lastLoss` |
+| `unstamped_legacy` | not a hold: a pre-epoch or legacy-capability unmarked session sent on the legacy path | decision basis |
+
+Backend refusals (for example `session_project_conflict`) are acknowledged discards stored as `lastDiscard`, not holds.
+
+### 7.6 Lifetime and retention
+
+- **Records are not spool state.** The spool sweep drains and removes spool data but keeps records. `sweepSpool` also runs record retention: idle records (default 90 days, `CODEMIE_EVIDENCE_RECORD_IDLE_DAYS`) and, oldest-first, records over the file cap (default 20,000, `CODEMIE_EVIDENCE_RECORD_MAX_FILES`) are evicted, except records of sessions with pending spool bytes. If pending sessions block the cap, new stamps fail with `evidence_capacity` until they drain.
+- **Client policy only.** Local eviction is a client decision. The backend keeps raw analytics for 90 days but keeps the session-to-project binding indefinitely by default, so a session re-stamped after local eviction is not proof of a fresh server session and may legitimately be answered `session_project_conflict`.
+- `epoch.json` in the spool root separates pre-existing (legacy, unmarked) sessions from new ones.
+
+### 7.7 Open PR seams
+
+These are unmerged and were not merged, cherry-picked or integration-tested here: CLI PRs #707, #710, #711, #667 and backend MR !4652. Expected textual conflicts: `forwarder.ts`, `session-project.ts`, `spool-io.ts`, `config.ts`, `OtlpAgentAdapter.ts`. #711 attaches at `setClassificationConsumer`; #710 (masking) is not touched. No combined-integration claim is made; the backend contract was read from a local backend branch only.
